@@ -10,6 +10,10 @@ from .account import Account
 from .imap import imap_get_email_code, imap_login
 from .logger import logger
 from .utils import utc
+from pkg.XClientTransaction.x_client_transaction.transaction import ClientTransaction
+from pkg.XClientTransaction.x_client_transaction.utils import generate_headers, handle_x_migration, get_ondemand_file_url
+import bs4
+import requests
 
 LOGIN_URL = "https://api.x.com/1.1/onboarding/task.json"
 
@@ -261,6 +265,8 @@ async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
     async with acc.make_client() as client:
         guest_token = await get_guest_token(client)
         client.headers["x-guest-token"] = guest_token
+        # set x-client-transaction-id to a random base64 string
+        client.headers["x-client-transaction-id"] = auto_gen_x_transaction_id()
 
         rep = await login_initiate(client)
         ctx = TaskCtx(client, acc, cfg, None, imap)
@@ -277,3 +283,26 @@ async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
         acc.headers = {k: v for k, v in client.headers.items()}
         acc.cookies = {k: v for k, v in client.cookies.items()}
         return acc
+
+def auto_gen_x_transaction_id() -> str:
+    # INITIALIZE SESSION
+    session = requests.Session()
+    session.headers = generate_headers()
+
+    # GET HOME PAGE RESPONSE
+    # required only when hitting twitter.com but not x.com
+    # returns bs4.BeautifulSoup object
+    home_page_response = handle_x_migration(session=session)
+
+    # for x.com no migration is required, just simply do
+    home_page = session.get(url="https://x.com")
+    home_page_response = bs4.BeautifulSoup(home_page.content, 'html.parser')
+
+    # GET ondemand.s FILE RESPONSE
+    ondemand_file_url = get_ondemand_file_url(response=home_page_response)
+    ondemand_file = session.get(url=ondemand_file_url)
+    ondemand_file_response = bs4.BeautifulSoup(ondemand_file.content, 'html.parser')
+
+    # response = handle_x_migration(session)
+    ct = ClientTransaction(home_page_response=home_page_response, ondemand_file_response=ondemand_file_response)
+    return ct.generate_transaction_id(method="POST", path="/1.1/onboarding/task.json")
