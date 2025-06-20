@@ -470,6 +470,63 @@ class Trend(JSONTrait):
         )
 
 
+@dataclass
+class HomeTimeline(JSONTrait):
+    tw_id: int
+    entry_id: str
+    sort_index: str
+    entry_type: str
+    cursorValue: str | None = None
+    cursorType: str | None = None
+    _type: str = "home_timeline"
+
+    @staticmethod
+    def parse(data: dict):
+        entries = []
+
+        # Get the timeline entries from the data
+        instructions = get_or(data, "data.home.home_timeline_urt.instructions", [])
+
+        for instruction in instructions:
+            if instruction.get("type") == "TimelineAddEntries":
+                for entry in instruction.get("entries", []):
+                    entry_id = entry.get("entryId", "")
+                    sort_index = entry.get("sortIndex", "")
+                    content = entry.get("content", {})
+                    entry_type = get_or(content, "entryType", "")
+
+                    # Handle different entry types
+                    if entry_type == "TimelineTimelineItem":
+                        # This is a tweet
+                        # Extract tweet ID from entry_id which has format "tweet-{tw_id}"
+                        if entry_id.startswith("tweet-"):
+                            tw_id = int(entry_id.split("-", 1)[1])
+                            entries.append(
+                                HomeTimeline(
+                                    tw_id=tw_id,
+                                    entry_id=entry_id,
+                                    sort_index=sort_index,
+                                    entry_type=entry_type
+                                )
+                            )
+                    elif entry_type == "TimelineTimelineCursor":
+                        # This is a cursor for pagination
+                        cursor_value = get_or(content, "value", None)
+                        cursor_type = get_or(content, "cursorType", None)
+                        if cursor_value and cursor_type:
+                            entries.append(
+                                HomeTimeline(
+                                    tw_id=0,  # Cursor doesn't have a tweet ID
+                                    entry_id=entry_id,
+                                    sort_index=sort_index,
+                                    entry_type=entry_type,
+                                    cursorValue=cursor_value,
+                                    cursorType=cursor_type
+                                )
+                            )
+
+        return entries
+
 def _parse_card_get_bool(values: list[dict], key: str):
     for x in values:
         if x["key"] == key:
@@ -704,30 +761,42 @@ def _parse_items(rep: httpx.Response, kind: str, limit: int = -1):
         Cls, key = Tweet, "tweets"
     elif kind == "trends":
         Cls, key = Trend, "trends"
+    elif kind == "home_timeline":
+        Cls, key = HomeTimeline, "home_timeline"
     else:
         raise ValueError(f"Invalid kind: {kind}")
 
     # check for dict, because httpx.Response can be mocked in tests with different type
     res = rep if isinstance(rep, dict) else rep.json()
-    obj = to_old_rep(res)
 
-    ids = set()
-    for x in obj[key].values():
-        if limit != -1 and len(ids) >= limit:
-            # todo: move somewhere in configuration like force_limit
-            # https://github.com/vladkens/twscrape/issues/26#issuecomment-1656875132
-            # break
-            pass
-
+    # Special handling for home_timeline
+    if kind == "home_timeline":
         try:
-            tmp = Cls.parse(x, obj)
-            if tmp.id not in ids:
-                ids.add(tmp.id)
-                yield tmp
+            entries = Cls.parse(res)
+            for entry in entries:
+                yield entry
         except Exception as e:
-            _write_dump(kind, e, x, obj)
-            continue
+            _write_dump(kind, e, res, {})
+            return
+    else:
+        obj = to_old_rep(res)
 
+        ids = set()
+        for x in obj[key].values():
+            if limit != -1 and len(ids) >= limit:
+                # todo: move somewhere in configuration like force_limit
+                # https://github.com/vladkens/twscrape/issues/26#issuecomment-1656875132
+                # break
+                pass
+
+            try:
+                tmp = Cls.parse(x, obj)
+                if tmp.id not in ids:
+                    ids.add(tmp.id)
+                    yield tmp
+            except Exception as e:
+                _write_dump(kind, e, x, obj)
+                continue
 
 # public helpers
 
@@ -776,3 +845,6 @@ def parse_users(rep: httpx.Response, limit: int = -1) -> Generator[User, None, N
 
 def parse_trends(rep: httpx.Response, limit: int = -1) -> Generator[Trend, None, None]:
     return _parse_items(rep, kind="trends", limit=limit)  # type: ignore
+
+def parse_home_timeline(rep: httpx.Response, limit: int = -1) -> Generator[HomeTimeline, None, None]:
+    return _parse_items(rep, kind="home_timeline", limit=limit)  # type: ignore

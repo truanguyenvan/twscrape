@@ -5,7 +5,7 @@ from httpx import Response
 
 from .accounts_pool import AccountsPool
 from .logger import set_log_level
-from .models import Tweet, User, parse_trends, parse_tweet, parse_tweets, parse_user, parse_users
+from .models import Tweet, User, HomeTimeline, parse_trends, parse_tweet, parse_tweets, parse_user, parse_users, parse_home_timeline
 from .queue_client import QueueClient
 from .utils import encode_params, find_obj, get_by_path
 
@@ -25,6 +25,7 @@ OP_UserCreatorSubscriptions = "7qcGrVKpcooih_VvJLA1ng/UserCreatorSubscriptions"
 OP_UserMedia = "vFPc2LVIu7so2uA_gHQAdg/UserMedia"
 OP_Bookmarks = "-LGfdImKeQz0xS_jjUwzlA/Bookmarks"
 OP_GenericTimelineById = "CT0YFEFf5GOYa5DJcxM91w/GenericTimelineById"
+OP_HomeLatestTimeline= "3E2DVgQT7WcQ2jQjJdKh9w/HomeLatestTimeline"
 
 GQL_URL = "https://x.com/i/api/graphql"
 GQL_FEATURES = {  # search values here (view source) https://x.com/
@@ -514,3 +515,55 @@ class API:
             async for rep in gen:
                 for x in parse_tweets(rep.json(), limit):
                     yield x
+
+        # Home timeline
+
+    async def home_latest_timeline_raw(self, limit=-1, kv: KV = None):
+        op = OP_HomeLatestTimeline
+        ft = {
+            "es_preview_enabled": True,
+            "c9s_tweet_anatomy_moderator_badge_enabled": True,
+            "communities_web_enable_tweet_community_results_fetch": True,
+            "creator_subscriptions_quote_tweet_preview_enabled": False,
+            "creator_subscriptions_tweet_preview_api_enabled": True,
+            "freedom_of_speech_not_reach_fetch_enabled": True,
+            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+            "longform_notetweets_consumption_enabled": True,
+            "longform_notetweets_inline_media_enabled": True,
+            "longform_notetweets_rich_text_read_enabled": True,
+            "premium_content_api_read_enabled": False,
+            "profile_label_improvements_pcf_label_in_post_enabled": True,
+            "responsive_web_edit_tweet_api_enabled": True,
+            "responsive_web_enhance_cards_enabled": False,
+            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+            "responsive_web_graphql_timeline_navigation_enabled": True,
+            "responsive_web_grok_analysis_button_from_backend": True,
+            "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+            "responsive_web_grok_analyze_post_followups_enabled": True,
+            "responsive_web_grok_image_annotation_enabled": True,
+            "responsive_web_grok_share_attachment_enabled": True,
+            "responsive_web_grok_show_grok_translated_post": False,
+            "responsive_web_jetfuel_frame": False,
+            "responsive_web_twitter_article_tweet_consumption_enabled": True,
+            "rweb_tipjar_consumption_enabled": True,
+            "rweb_video_screen_enabled": False,
+            "standardized_nudges_misinfo": True,
+            "tweet_awards_web_tipping_enabled": False,
+            "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+            "verified_phone_label_enabled": False,
+            "view_counts_everywhere_api_enabled": True
+        }
+        kv = {
+            "count": 40,
+            "requestContext": "launch",
+            "includePromotedContent": True,
+            "latestControlAvailable": True,
+            **(kv or {})
+        }
+        return await self._gql_item(op, kv, ft)
+
+    async def home_latest_timeline(self, limit=-1, kv: KV = None) -> list[HomeTimeline] | None:
+        rep = await self.home_latest_timeline_raw(limit=limit, kv=kv)
+        if not rep:
+            return None
+        return list(parse_home_timeline(rep, limit=limit)) if rep else None
