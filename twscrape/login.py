@@ -218,14 +218,14 @@ async def next_login_task(ctx: TaskCtx, rep: Response):
     ct0 = ctx.client.cookies.get("ct0", None)
     if ct0:
         ctx.client.headers["x-csrf-token"] = ct0
-        ctx.client.headers["x-twitter-auth-type"] = "OAuth2Session"
+        ctx.client.headers["x-twitter-auth-type"] = 'OAuth2Client' if ctx.client.cookies.get('auth_token') else ''
 
     ctx.prev = rep.json()
     assert "flow_token" in ctx.prev, f"flow_token not in {rep.text}"
 
     for x in ctx.prev["subtasks"]:
         task_id = x["subtask_id"]
-
+        logger.info(f"login_step={task_id}")
         try:
             if task_id == "LoginSuccessSubtask":
                 return await login_success(ctx)
@@ -244,7 +244,7 @@ async def next_login_task(ctx: TaskCtx, rep: Response):
             if task_id == "LoginJsInstrumentationSubtask":
                 return await login_instrumentation(ctx)
             if task_id == "LoginEnterAlternateIdentifierSubtask":
-                return await login_alternate_identifier(ctx, username=ctx.acc.username)
+                return await login_alternate_identifier(ctx, username=ctx.acc.email)
         except Exception as e:
             ctx.acc.error_msg = f"login_step={task_id} err={e}"
             raise e
@@ -277,7 +277,7 @@ async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
 
         assert "ct0" in client.cookies, "ct0 not in cookies (most likely ip ban)"
         client.headers["x-csrf-token"] = client.cookies["ct0"]
-        client.headers["x-twitter-auth-type"] = "OAuth2Session"
+        client.headers["x-twitter-auth-type"] = 'OAuth2Client' if ctx.client.cookies.get('auth_token') else ''
 
         acc.active = True
         acc.headers = {k: v for k, v in client.headers.items()}
@@ -295,8 +295,8 @@ def auto_gen_x_transaction_id() -> str:
     home_page_response = handle_x_migration(session=session)
 
     # for x.com no migration is required, just simply do
-    home_page = session.get(url="https://x.com")
-    home_page_response = bs4.BeautifulSoup(home_page.content, 'html.parser')
+    # home_page = session.get(url="https://x.com")
+    # home_page_response = bs4.BeautifulSoup(home_page.content, 'html.parser')
 
     # GET ondemand.s FILE RESPONSE
     ondemand_file_url = get_ondemand_file_url(response=home_page_response)

@@ -30,3 +30,9 @@ def _filter(r):
 
 logger.remove()
 logger.add(sys.stderr, filter=_filter)
+
+# import logging
+# from typing import Literal
+# logger = logging.getLogger("twscrape")
+# def set_log_level(level: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]):
+#     logger.setLevel(level)

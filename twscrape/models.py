@@ -155,6 +155,29 @@ class User(JSONTrait):
             pinnedIds=[int(x) for x in obj.get("pinned_tweet_ids_str", [])],
         )
 
+    @staticmethod
+    def parse_v2(obj: dict, res=None):
+        """
+        Parse a user object from Twitter API v2 response.
+        """
+        return User(
+            id=int(obj.get("rest_id", 0)),
+            id_str=obj.get("rest_id", ""),
+            url=f"https://x.com/{obj.get('core', {}).get('screen_name')}",
+            username=obj.get('core', {}).get('screen_name', ""),
+            displayname=obj.get('core', {}).get("name", ""),
+            rawDescription=obj.get("legacy", {}).get("description", ""),
+            followersCount=obj.get("legacy", {}).get("followers_count", 0),
+            profileImageUrl=obj.get("avatar", {}).get("image_url", ""),
+            profileBannerUrl=obj.get("profile_banner_url", ""),
+            created=datetime.now(),
+            friendsCount=obj.get("legacy", {}).get("friends_count", 0),
+            statusesCount=obj.get("legacy", {}).get("statuses_count", 0),
+            favouritesCount=obj.get("legacy", {}).get("favourites_count", 0),
+            listedCount=obj.get("legacy", {}).get("listed_count", 0),
+            mediaCount=obj.get("legacy", {}).get("media_count", 0),
+            location=obj.get("legacy", {}).get("location", ""),
+        )
 
 @dataclass
 class Tweet(JSONTrait):
@@ -245,6 +268,62 @@ class Tweet(JSONTrait):
             inReplyToTweetId=int_or(obj, "in_reply_to_status_id_str"),
             inReplyToTweetIdStr=get_or(obj, "in_reply_to_status_id_str"),
             inReplyToUser=_get_reply_user(obj, res),
+            source=obj.get("source", None),
+            sourceUrl=_get_source_url(obj),
+            sourceLabel=_get_source_label(obj),
+            media=Media.parse(obj),
+            card=_parse_card(obj, url),
+            possibly_sensitive=obj.get("possibly_sensitive", None),
+        )
+
+        # issue #42 – restore full rt text
+        rt = doc.retweetedTweet
+        if rt is not None and rt.user is not None and doc.rawContent.endswith("…"):
+            rt_msg = f"RT @{rt.user.username}: {rt.rawContent}"
+            if doc.rawContent != rt_msg:
+                doc.rawContent = rt_msg
+
+        return doc
+
+    @staticmethod
+    def parse_v2(res: dict):
+        user_obj = res.get("core", {}).get("user_results", {}).get("result", {})
+        tw_usr = User.parse_v2(user_obj)
+
+        rt_obj = res.get("retweeted_status_result", {}).get("result", {})
+        qt_obj = res.get("quoted_status_result", {}).get("result", {})
+
+        url = f"https://x.com/{tw_usr.username}/status/{res.get('rest_id')}"
+        obj = res.get("legacy", {})
+        doc = Tweet(
+            id=int(res.get('rest_id')),
+            id_str=res.get('rest_id'),
+            url=url,
+            date=email.utils.parsedate_to_datetime(obj["created_at"]),
+            user=tw_usr,
+            lang=obj["lang"],
+            rawContent=get_or(obj, "note_tweet.note_tweet_results.result.text", obj["full_text"]),
+            replyCount=obj["reply_count"],
+            retweetCount=obj["retweet_count"],
+            likeCount=obj["favorite_count"],
+            quoteCount=obj["quote_count"],
+            bookmarkedCount=get_or(obj, "bookmark_count", 0),
+            conversationId=int(obj["conversation_id_str"]),
+            conversationIdStr=obj["conversation_id_str"],
+            hashtags=[x["text"] for x in get_or(obj, "entities.hashtags", [])],
+            cashtags=[x["text"] for x in get_or(obj, "entities.symbols", [])],
+            mentionedUsers=[UserRef.parse(x) for x in get_or(obj, "entities.user_mentions", [])],
+            links=_parse_links(
+                obj, ["entities.urls", "note_tweet.note_tweet_results.result.entity_set.urls"]
+            ),
+            viewCount=_get_views(obj, rt_obj or {}),
+            retweetedTweet=Tweet.parse_v2(rt_obj) if rt_obj else None,
+            quotedTweet=Tweet.parse_v2(qt_obj) if qt_obj else None,
+            place=Place.parse(obj["place"]) if obj.get("place") else None,
+            coordinates=Coordinates.parse(obj),
+            inReplyToTweetId=int_or(obj, "in_reply_to_status_id_str"),
+            inReplyToTweetIdStr=get_or(obj, "in_reply_to_status_id_str"),
+            inReplyToUser=None,
             source=obj.get("source", None),
             sourceUrl=_get_source_url(obj),
             sourceLabel=_get_source_label(obj),
@@ -478,6 +557,7 @@ class HomeTimeline(JSONTrait):
     entry_type: str
     cursorValue: str | None = None
     cursorType: str | None = None
+    Tweet: Optional[Tweet] = None
     _type: str = "home_timeline"
 
     @staticmethod
@@ -501,12 +581,17 @@ class HomeTimeline(JSONTrait):
                         # Extract tweet ID from entry_id which has format "tweet-{tw_id}"
                         if entry_id.startswith("tweet-"):
                             tw_id = int(entry_id.split("-", 1)[1])
+                            item_content = content.get("itemContent", {})
+                            tw_results = item_content.get("tweet_results", {})
+                            result = tw_results.get("result", {})
+                            tw = parse_tweet_from_json(result, tw_id)
                             entries.append(
                                 HomeTimeline(
                                     tw_id=tw_id,
                                     entry_id=entry_id,
                                     sort_index=sort_index,
-                                    entry_type=entry_type
+                                    entry_type=entry_type,
+                                    Tweet=tw
                                 )
                             )
                     elif entry_type == "TimelineTimelineCursor":
@@ -780,7 +865,6 @@ def _parse_items(rep: httpx.Response, kind: str, limit: int = -1):
             return
     else:
         obj = to_old_rep(res)
-
         ids = set()
         for x in obj[key].values():
             if limit != -1 and len(ids) >= limit:
@@ -798,8 +882,13 @@ def _parse_items(rep: httpx.Response, kind: str, limit: int = -1):
                 _write_dump(kind, e, x, obj)
                 continue
 
-# public helpers
-
+def parse_tweet_from_json(res, twid: int) -> Tweet | None:
+    try:
+        tw = Tweet.parse_v2(res)
+        return tw
+    except Exception as e:
+        logger.error(f"Failed to parse tweet {twid} - {type(e)}:\n{traceback.format_exc()}")
+        return None
 
 def parse_tweet(rep: httpx.Response, twid: int) -> Tweet | None:
     try:
@@ -811,7 +900,6 @@ def parse_tweet(rep: httpx.Response, twid: int) -> Tweet | None:
     except Exception as e:
         logger.error(f"Failed to parse tweet {twid} - {type(e)}:\n{traceback.format_exc()}")
         return None
-
 
 def parse_user(rep: httpx.Response) -> User | None:
     try:

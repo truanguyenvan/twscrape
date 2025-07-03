@@ -2,12 +2,14 @@ from contextlib import aclosing
 from typing import Literal
 
 from httpx import Response
+from copy import deepcopy
 
 from .accounts_pool import AccountsPool
 from .logger import set_log_level
 from .models import Tweet, User, HomeTimeline, parse_trends, parse_tweet, parse_tweets, parse_user, parse_users, parse_home_timeline
 from .queue_client import QueueClient
 from .utils import encode_params, find_obj, get_by_path
+from pkg.redis.client import RedisClient
 
 # OP_{NAME} – {NAME} should be same as second part of GQL ID (required to auto-update script)
 OP_SearchTimeline = "AIdc203rPpK_k_2KWSdm7g/SearchTimeline"
@@ -26,8 +28,10 @@ OP_UserMedia = "vFPc2LVIu7so2uA_gHQAdg/UserMedia"
 OP_Bookmarks = "-LGfdImKeQz0xS_jjUwzlA/Bookmarks"
 OP_GenericTimelineById = "CT0YFEFf5GOYa5DJcxM91w/GenericTimelineById"
 OP_HomeLatestTimeline= "3E2DVgQT7WcQ2jQjJdKh9w/HomeLatestTimeline"
+OP_TweetResultByRestId= "D_jNhjWZeRZT5NURzfJZSQ/TweetResultByRestId"
 
-GQL_URL = "https://x.com/i/api/graphql"
+GQL_URL = "https://api.x.com/graphql"
+GQL_URL2 = "https://api.x.com/graphql"
 GQL_FEATURES = {  # search values here (view source) https://x.com/
     "articles_preview_enabled": False,
     "c9s_tweet_anatomy_moderator_badge_enabled": True,
@@ -67,9 +71,66 @@ GQL_FEATURES = {  # search values here (view source) https://x.com/
     "responsive_web_grok_show_grok_translated_post": True,
 }
 
+GQL_NO_AUTH_FEATURES = {  # search values here (view source) https://x.com/
+    "articles_preview_enabled": False,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_media_download_video_enabled": False,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "rweb_tipjar_consumption_enabled": True,
+    "rweb_video_timestamps_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "tweet_with_visibility_results_prefer_gql_media_interstitial_enabled": False,
+    "tweetypie_unmention_optimization_enabled": True,
+    "verified_phone_label_enabled": False,
+    "view_counts_everywhere_api_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "premium_content_api_read_enabled": False,
+    "profile_label_improvements_pcf_label_in_post_enabled": False,
+    "responsive_web_grok_share_attachment_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": False,
+    "responsive_web_grok_image_annotation_enabled": False,
+    "responsive_web_grok_analysis_button_from_backend": False,
+    "responsive_web_jetfuel_frame": False,
+    "rweb_video_screen_enabled": True,
+    "responsive_web_grok_show_grok_translated_post": True,
+    "interactive_text_enabled": False,
+    "responsive_web_text_conversations_enabled": False,
+    "vibe_api_enabled": False,
+    "responsive_web_twitter_blue_verified_badge_is_enabled": False,
+    "longform_notetweets_richtext_consumption_enabled": False
+}
 KV = dict | None
 TrendId = Literal["trending", "news", "sport", "entertainment"] | str
 
+follow_settings = {
+    'include_profile_interstitial_type': '1',
+    'include_blocking': '1',
+    'include_blocked_by': '1',
+    'include_followed_by': '1',
+    'include_want_retweets': '1',
+    'include_mute_edge': '1',
+    'include_can_dm': '1',
+    'include_can_media_tag': '1',
+    'include_ext_has_nft_avatar': '1',
+    'include_ext_is_blue_verified': '1',
+    'include_ext_verified_type': '1',
+    'skip_status': '1',
+}
 
 class API:
     # Note: kv is variables, ft is features from original GQL request
@@ -81,6 +142,7 @@ class API:
         debug=False,
         proxy: str | None = None,
         raise_when_no_account=False,
+        redis_client: RedisClient | None = None
     ):
         if isinstance(pool, AccountsPool):
             self.pool = pool
@@ -91,6 +153,9 @@ class API:
 
         self.proxy = proxy
         self.debug = debug
+        self.redis_client = redis_client
+        self.v1_api = 'https://api.twitter.com/1.1'
+        self.v2_api = 'https://twitter.com/i/api/2'
         if self.debug:
             set_log_level("DEBUG")
 
@@ -157,6 +222,20 @@ class API:
         async with QueueClient(self.pool, queue, self.debug, proxy=self.proxy) as client:
             params = {"variables": {**kv}, "features": {**GQL_FEATURES, **ft}}
             return await client.get(f"{GQL_URL}/{op}", params=encode_params(params))
+
+    async def _ggl_item_with_no_account(self, op: str, kv: dict, ft: dict | None = None):
+        ft = ft or {}
+        queue = op.split("/")[-1]
+        async with QueueClient(None, queue, self.debug, proxy=self.proxy, redis_client=self.redis_client) as client:
+            ft = {"creator_subscriptions_tweet_preview_api_enabled":True,"premium_content_api_read_enabled":False,"communities_web_enable_tweet_community_results_fetch":True,"c9s_tweet_anatomy_moderator_badge_enabled":True,"responsive_web_grok_analyze_button_fetch_trends_enabled":False,"responsive_web_grok_analyze_post_followups_enabled":False,"responsive_web_jetfuel_frame":False,"responsive_web_grok_share_attachment_enabled":True,"articles_preview_enabled":True,"responsive_web_edit_tweet_api_enabled":True,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":True,"view_counts_everywhere_api_enabled":True,"longform_notetweets_consumption_enabled":True,"responsive_web_twitter_article_tweet_consumption_enabled":True,"tweet_awards_web_tipping_enabled":False,"responsive_web_grok_show_grok_translated_post":False,"responsive_web_grok_analysis_button_from_backend":True,"creator_subscriptions_quote_tweet_preview_enabled":False,"freedom_of_speech_not_reach_fetch_enabled":True,"standardized_nudges_misinfo":True,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":True,"longform_notetweets_rich_text_read_enabled":True,"longform_notetweets_inline_media_enabled":True,"payments_enabled":False,"profile_label_improvements_pcf_label_in_post_enabled":True,"rweb_tipjar_consumption_enabled":True,"verified_phone_label_enabled":False,"responsive_web_grok_image_annotation_enabled":True,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":False,"responsive_web_graphql_timeline_navigation_enabled":True,"responsive_web_enhance_cards_enabled":False}
+            params = {"variables": {**kv}, "features": {**GQL_NO_AUTH_FEATURES, **ft}}
+            return await client.get_with_no_account(f"{GQL_URL2}/{op}", params=encode_params(params))
+
+    # v1 helpers
+    async def _v1(self, op:str, path:str, params: dict | None = None):
+        queue = op.split("/")[-1]
+        async with QueueClient(self.pool, queue, self.debug, proxy=self.proxy) as client:
+            return await client.post_form(f'{self.v1_api}/{path}', params=encode_params(params))
 
     # search
 
@@ -249,6 +328,26 @@ class API:
         rep = await self.tweet_details_raw(twid, kv=kv)
         return parse_tweet(rep, twid) if rep else None
 
+    async def tweet_result_by_rest_id_raw(self, twid: int, kv: KV = None):
+        op = OP_TweetResultByRestId
+        kv = {
+            "tweetId":str(twid),
+            "withCommunity":False,
+            "includePromotedContent":False,
+            "withVoice":False,
+            "withDownvotePerspective": False,
+            "withReactionsMetadata": False,
+            "withReactionsPerspective": False,
+            "withSuperFollowsTweetFields": False,
+            "withSuperFollowsUserFields": False,
+            **(kv or {}),
+        }
+        return await self._ggl_item_with_no_account(op, kv)
+
+    async def tweet_result_by_rest_id(self, twid: int, kv: KV = None) -> Tweet | None:
+        rep = await self.tweet_result_by_rest_id_raw(twid, kv=kv)
+        return parse_tweet(rep, twid) if rep else None
+
     # tweet_replies
     # note: uses same op as tweet_details, see: https://github.com/vladkens/twscrape/issues/104
 
@@ -329,7 +428,6 @@ class API:
                     yield x
 
     # subscriptions
-
     async def subscriptions_raw(self, uid: int, limit=-1, kv: KV = None):
         op = OP_UserCreatorSubscriptions
         kv = {"userId": str(uid), "count": 20, "includePromotedContent": False, **(kv or {})}
@@ -556,7 +654,7 @@ class API:
         kv = {
             "count": 40,
             "requestContext": "launch",
-            "includePromotedContent": True,
+            "includePromotedContent": False,
             "latestControlAvailable": True,
             **(kv or {})
         }
@@ -567,3 +665,30 @@ class API:
         if not rep:
             return None
         return list(parse_home_timeline(rep, limit=limit)) if rep else None
+
+    # follow account
+    async def follow(self, user_id: int, kv: KV = None):
+        """
+        Follow a user by their user ID.
+        :param user_id: The ID of the user to follow.
+        :param kv: Additional parameters for the request.
+        :return: Response from the follow request.
+        """
+        path = "friendships/create.json"
+        settings = deepcopy(follow_settings)
+        settings |= {"user_id": user_id}
+        op = OP_Following
+        return await self._v1(op, path, settings)
+
+    async def unfollow(self, user_id: int, kv: KV = None):
+        """
+        Unfollow a user by their user ID.
+        :param user_id: The ID of the user to unfollow.
+        :param kv: Additional parameters for the request.
+        :return: Response from the unfollow request.
+        """
+        path = "friendships/destroy.json"
+        settings = deepcopy(follow_settings)
+        settings |= {"user_id": user_id}
+        op = OP_Following
+        return await self._v1(op, path, settings)
